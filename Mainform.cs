@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 
 namespace PhysicsSim
@@ -11,8 +12,13 @@ namespace PhysicsSim
 
         // Mouse state
         private SoftBody? _grabbed = null;
+        private Node? _grabbedNode = null;  // the specific node being held
         private PointF _lastMousePos;
         private PointF _throwVelocity;
+
+        // Grab spring constants
+        private const float GrabStiffness = 1200f;
+        private const float GrabDamping = 40f;
 
         // Spawn settings
         private int _spawnCols = 5;
@@ -30,10 +36,17 @@ namespace PhysicsSim
             Color.FromArgb(255, 220, 80),
         };
         private int _colorIndex = 0;
-        private Random _rng = new();
 
         private Label? _infoLabel;
         private Panel? _canvas;
+
+        // Cached GDI resources
+        private SolidBrush _floorBrush = new SolidBrush(Color.FromArgb(50, 80, 120));
+        private Pen _floorPen = new Pen(Color.FromArgb(80, 130, 190), 2f);
+        private Font _hudFont = new Font("Segoe UI", 9f);
+        private SolidBrush _hudBrush = new SolidBrush(Color.FromArgb(80, 150, 220));
+        private SolidBrush _particleBrush = new SolidBrush(Color.White);
+        private Pen _grabLinePen = new Pen(Color.FromArgb(180, 255, 255, 255), 1f) { DashStyle = DashStyle.Dot };
 
         public MainForm()
         {
@@ -44,16 +57,39 @@ namespace PhysicsSim
 
             BuildUI();
 
-            _world = new PhysicsWorld(new RectangleF(0, 0, _canvas!.Width, _canvas!.Height - 40));;
+            _world = new PhysicsWorld(new RectangleF(0, 0, _canvas!.Width, _canvas!.Height - 40));
 
-            _gameTimer = new System.Windows.Forms.Timer { Interval = 16 }; // ~60fps
+            _gameTimer = new System.Windows.Forms.Timer { Interval = 16 };
             _gameTimer.Tick += GameLoop;
             _gameTimer.Start();
         }
 
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            _world.Bounds = new RectangleF(0, 0, _canvas!.Width, _canvas!.Height - 40);
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (_world != null && _canvas != null)
+                _world.Bounds = new RectangleF(0, 0, _canvas.Width, _canvas.Height - 40);
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            base.OnFormClosing(e);
+            _floorBrush.Dispose();
+            _floorPen.Dispose();
+            _hudFont.Dispose();
+            _hudBrush.Dispose();
+            _particleBrush.Dispose();
+            _grabLinePen.Dispose();
+        }
+
         private void BuildUI()
         {
-            // Sidebar
             var sidebar = new Panel
             {
                 Dock = DockStyle.Right,
@@ -125,9 +161,6 @@ namespace PhysicsSim
             clearBtn.Click += (s, e) => _world.Bodies.Clear();
             sidebar.Controls.Add(clearBtn);
 
-            Controls.Add(sidebar);
-
-            // Info label
             _infoLabel = new Label
             {
                 Dock = DockStyle.Bottom,
@@ -141,7 +174,6 @@ namespace PhysicsSim
             };
             Controls.Add(_infoLabel);
 
-            // Canvas
             _canvas = new Panel
             {
                 Dock = DockStyle.Fill,
@@ -152,21 +184,38 @@ namespace PhysicsSim
             _canvas.MouseMove += OnMouseMove;
             _canvas.MouseUp += OnMouseUp;
             Controls.Add(_canvas);
+
+            Controls.Add(sidebar);
         }
 
         private void GameLoop(object? sender, EventArgs e)
         {
-            float dt = 0.016f / 8f; // smaller substep
-            for (int i = 0; i < 8; i++)
+            // Apply grab spring force to the grabbed node each frame
+            if (_grabbed != null && _grabbedNode != null)
             {
-                if (_grabbed != null)
-                {
-                    _grabbed.Position = _lastMousePos;
-                    foreach (var node in _grabbed.Nodes)
-                        node.Velocity = PointF.Empty;
+                float dx = _lastMousePos.X - _grabbedNode.Position.X;
+                float dy = _lastMousePos.Y - _grabbedNode.Position.Y;
+
+                // Spring pull toward mouse
+                _grabbedNode.Velocity = new PointF(
+                    _grabbedNode.Velocity.X + dx * GrabStiffness * 0.016f / (_grabbed.Mass / _grabbed.Nodes.Count)
+                        - _grabbedNode.Velocity.X * GrabDamping * 0.016f,
+                    _grabbedNode.Velocity.Y + dy * GrabStiffness * 0.016f / (_grabbed.Mass / _grabbed.Nodes.Count)
+                        - _grabbedNode.Velocity.Y * GrabDamping * 0.016f
+                );
             }
-            _world.Step(dt);
-        }
+
+            int totalNodes = 0;
+            foreach (var b in _world.Bodies) totalNodes += b.Nodes.Count;
+
+            int substeps = totalNodes < 100 ? 8
+                         : totalNodes < 250 ? 5
+                         : totalNodes < 500 ? 3
+                         : 2;
+
+            float dt = 0.016f / substeps;
+            for (int i = 0; i < substeps; i++)
+                _world.Step(dt);
 
             _world.Bounds = new RectangleF(0, 0, _canvas!.Width, _canvas!.Height - 40);
             _canvas!.Invalidate();
@@ -175,30 +224,38 @@ namespace PhysicsSim
         private void OnCanvasPaint(object? sender, PaintEventArgs e)
         {
             var g = e.Graphics;
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
 
-            // Draw floor
-            using var floorBrush = new SolidBrush(Color.FromArgb(50, 80, 120));
-            using var floorPen = new Pen(Color.FromArgb(80, 130, 190), 2f);
+            // Floor
             int floorY = _canvas!.Height - 40;
-            g.FillRectangle(floorBrush, 0, floorY, _canvas.Width, 40);
-            g.DrawLine(floorPen, 0, floorY, _canvas.Width, floorY);
-            // Draw particles
+            g.FillRectangle(_floorBrush, 0, floorY, _canvas.Width, 40);
+            g.DrawLine(_floorPen, 0, floorY, _canvas.Width, floorY);
+
+            // Particles
             foreach (var p in _world.Particles)
             {
-                float alpha = p.Life / p.MaxLife;
-                using var brush = new SolidBrush(Color.FromArgb((int)(alpha * 200), p.Color));
-                g.FillEllipse(brush, p.Position.X - p.Size / 2, p.Position.Y - p.Size / 2, p.Size, p.Size);
+                int alpha = (int)(p.Life / p.MaxLife * 200);
+                _particleBrush.Color = Color.FromArgb(alpha, p.Color);
+                g.FillEllipse(_particleBrush, p.Position.X - p.Size / 2, p.Position.Y - p.Size / 2, p.Size, p.Size);
             }
 
-            // Draw bodies
+            // Bodies
             foreach (var body in _world.Bodies)
                 body.Draw(g);
 
+            // Draw grab line from mouse to grabbed node
+            if (_grabbed != null && _grabbedNode != null)
+            {
+                g.DrawLine(_grabLinePen, _lastMousePos, _grabbedNode.Position);
+                g.FillEllipse(_floorBrush, _grabbedNode.Position.X - 5, _grabbedNode.Position.Y - 5, 10, 10);
+            }
+
             // HUD
-            using var hudFont = new Font("Segoe UI", 9f);
-            using var hudBrush = new SolidBrush(Color.FromArgb(80, 150, 220));
-            g.DrawString($"Bodies: {_world.Bodies.Count}   Particles: {_world.Particles.Count}", hudFont, hudBrush, 8, 8);
+            int totalNodes = 0;
+            foreach (var b in _world.Bodies) totalNodes += b.Nodes.Count;
+            g.DrawString(
+                $"Bodies: {_world.Bodies.Count}   Nodes: {totalNodes}   Particles: {_world.Particles.Count}",
+                _hudFont, _hudBrush, 8, 8);
         }
 
         private void OnMouseDown(object? sender, MouseEventArgs e)
@@ -211,6 +268,7 @@ namespace PhysicsSim
                 if (hit != null)
                 {
                     _grabbed = hit;
+                    _grabbedNode = _world.GetClosestNode(hit, pos);
                     _grabbed.IsGrabbed = true;
                 }
                 else
@@ -238,12 +296,9 @@ namespace PhysicsSim
                     (pos.X - _lastMousePos.X) / 0.016f,
                     (pos.Y - _lastMousePos.Y) / 0.016f
                 );
-                _lastMousePos = pos;
             }
-            else
-            {
-                _lastMousePos = pos;
-            }
+
+            _lastMousePos = pos;
         }
 
         private void OnMouseUp(object? sender, MouseEventArgs e)
@@ -251,10 +306,14 @@ namespace PhysicsSim
             if (_grabbed != null)
             {
                 _grabbed.IsGrabbed = false;
-                // Apply throw velocity
+                // Apply throw velocity to all nodes
                 foreach (var node in _grabbed.Nodes)
-                    node.Velocity = _throwVelocity;
+                    node.Velocity = new PointF(
+                        node.Velocity.X + _throwVelocity.X * 0.3f,
+                        node.Velocity.Y + _throwVelocity.Y * 0.3f
+                    );
                 _grabbed = null;
+                _grabbedNode = null;
             }
         }
 
