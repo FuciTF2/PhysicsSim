@@ -15,7 +15,7 @@ A sandbox desktop physics toy built with C# and WinForms. Spawn soft body object
 ## Running
 
 ```bash
-git clone <your-repo-url>
+git clone <https://github.com/FuciTF2/PhysicsSim.git>
 cd PhysicsSim
 dotnet run
 ```
